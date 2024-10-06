@@ -7,6 +7,7 @@ from sklearn.ensemble import RandomForestClassifier
 from io import BytesIO
 import base64
 from fastapi.middleware.cors import CORSMiddleware
+from matplotlib.dates import date2num
 
 app = FastAPI()
 
@@ -19,6 +20,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def identify_wave_types(df):
+    """
+    Function to identify P-waves, S-waves, and Surface waves based on velocity.
+    """
+    # Initialize the wave_type column
+    df['wave_type'] = 'None'  # Default value
+
+    # Thresholds for classification (can be adjusted based on your data)
+    p_wave_threshold = df['velocity'].quantile(0.90)  # Example threshold for P-waves
+    s_wave_threshold = df['velocity'].quantile(0.95)  # Example threshold for S-waves
+
+    # Classify waves based on velocity
+    df.loc[df['velocity'] <= p_wave_threshold, 'wave_type'] = 'P-wave'
+    df.loc[(df['velocity'] > p_wave_threshold) & (df['velocity'] <= s_wave_threshold), 'wave_type'] = 'S-wave'
+    df.loc[df['velocity'] > s_wave_threshold, 'wave_type'] = 'Surface wave'
+
+    return df
+
 @app.post("/predict-seismic-events/")
 async def predict_seismic_events(file: UploadFile = File(...)):
     # Load the dataset from the uploaded CSV file
@@ -26,6 +45,13 @@ async def predict_seismic_events(file: UploadFile = File(...)):
 
     # Limit data to the first 1000 rows for faster processing
     data_limited = data.head(1000).copy()  # Explicitly create a copy of the DataFrame
+    
+    # Convert `abs_time` to datetime format
+    data_limited['abs_time'] = pd.to_datetime(data_limited['abs_time'])
+    
+    # Calculate time in seconds from the start time
+    start_time = data_limited['abs_time'].min()
+    data_limited['time_in_seconds'] = (data_limited['abs_time'] - start_time).dt.total_seconds()
 
     # Now modify the copied DataFrame
     data_limited['velocity_diff'] = data_limited['velocity'].diff()
@@ -39,7 +65,8 @@ async def predict_seismic_events(file: UploadFile = File(...)):
     # Label seismic events based on velocity changes
     threshold = data_limited['velocity_diff'].quantile(0.95)  # 95th percentile as threshold
     data_limited['seismic_event'] = (data_limited['velocity_diff'] > threshold).astype(int)
-
+    
+    data_limited = identify_wave_types(data_limited)
 
     # Train the Random Forest model
     features = ['velocity', 'velocity_diff', 'rolling_mean', 'rolling_std']
@@ -55,7 +82,7 @@ async def predict_seismic_events(file: UploadFile = File(...)):
     predicted_seismic_events = clf.predict(X)
 
     # Plotting
-    csv_times = np.array(data_limited['abs_time'].tolist())
+    csv_times = data_limited['time_in_seconds']
     csv_data = np.array(data_limited['velocity'].tolist())
 
     # Create the plot
@@ -66,6 +93,15 @@ async def predict_seismic_events(file: UploadFile = File(...)):
     for i, pred in enumerate(predicted_seismic_events):
         if pred == 1:  # Seismic event detected
             plt.axvline(x=csv_times[i], color='red', linestyle='--', linewidth=1)
+            
+        # Highlight P-waves, S-waves, and Surface waves
+    for i, wave_type in enumerate(data_limited['wave_type']):
+        if wave_type == 'P-wave':
+            plt.axvline(x=csv_times.iloc[i], color='green', linestyle='--', linewidth=1)
+        elif wave_type == 'S-wave':
+            plt.axvline(x=csv_times.iloc[i], color='orange', linestyle='--', linewidth=1)
+        elif wave_type == 'Surface wave':
+            plt.axvline(x=csv_times.iloc[i], color='purple', linestyle='--', linewidth=1)
 
     # Make the plot pretty
     plt.xlim([min(csv_times), max(csv_times)])
@@ -83,9 +119,23 @@ async def predict_seismic_events(file: UploadFile = File(...)):
     plt.savefig(buf, format="png")
     buf.seek(0)
     plot_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    
+    # Plot the spectrogram again and save it
+    plt.figure(figsize=(12, 4))
+    plt.specgram(csv_data, Fs=1, NFFT=256, noverlap=128, cmap='plasma', scale='dB')
+    plt.colorbar(label='Intensity (dB)')
+    plt.ylabel('Frequency (Hz)')
+    plt.xlabel('Time (s)')
+    plt.title('Spectrogram of Velocity Signal')
+
+    buf_spectrogram = BytesIO()
+    plt.savefig(buf_spectrogram, format="png")
+    buf_spectrogram.seek(0)
+    spectrogram_base64 = base64.b64encode(buf_spectrogram.getvalue()).decode('utf-8')
 
     # Return JSON response with the base64-encoded plot and predicted seismic events
     return {
-        "predicted_seismic_events":  "\n".join(map(str, predicted_seismic_events)),
-        "plot": plot_base64
-    }
+        "predicted_seismic_events": predicted_seismic_events.tolist(),
+        "plot": plot_base64,
+        "spectrogram":  spectrogram_base64
+        }
